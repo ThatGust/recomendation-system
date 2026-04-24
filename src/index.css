@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@theme {
+  --font-serif: "Georgia", serif;
+  --font-sans: "Helvetica Neue", "Arial", sans-serif;
+  --color-editorial-bg: #0A0A0A;
+  --color-editorial-accent: #FF4E00;
+  --color-editorial-dim: #888;
+  --color-editorial-border: #222;
+  --color-editorial-card-bg: #1A1A1A;
+}
+
+@layer base {
+  body {
+    @apply bg-editorial-bg text-white font-sans;
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "S.D.R",
+  "description": "A high-performance movie recommendation engine built from scratch using Item-based Collaborative Filtering on MovieLens data. Implements multiple distance metrics (Euclidean, Manhattan, Cosine, Pearson) and K-NN without external ML libraries.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
