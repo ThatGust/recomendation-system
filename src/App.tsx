@@ -1,13 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Search, Film, Star, TrendingUp, Upload, AlertCircle } from 'lucide-react';
+import { Search, Film, Star, TrendingUp, Upload, AlertCircle, Box } from 'lucide-react';
+import { RecommendationGraph } from './components/RecommendationGraph';
 
 interface Movie {
   movieId: string;
   title: string;
   genres: string[];
-  score?: number;
-  avgRating?: number;
+  score: number;
+  avgRating: number;
+  ratingsCount: number;
 }
 
 export default function App() {
@@ -228,21 +230,39 @@ export default function App() {
 
                   <div className="mt-10 pt-5 border-t border-editorial-border">
                     <span className="block text-editorial-dim text-[11px] uppercase tracking-[2px] font-bold mb-4">
-                      Algoritmo: K-NN ({metric})
+                      Similitud: {metric}
+                    </span>
+                    
+                    <div className="flex flex-wrap gap-2 mb-8">
+                      {['genome', 'cosine', 'pearson', 'euclidean', 'manhattan'].map((m) => (
+                        <button
+                          key={m}
+                          onClick={() => setMetric(m)}
+                          className={`text-[9px] uppercase tracking-widest font-bold px-2 py-1 border transition-all ${
+                            metric === m ? 'border-editorial-accent text-editorial-accent' : 'border-editorial-border text-editorial-dim hover:text-white'
+                          }`}
+                        >
+                          {m === 'genome' ? 'Tag Genome' : m}
+                        </button>
+                      ))}
+                    </div>
+
+                    <span className="block text-editorial-dim text-[11px] uppercase tracking-[2px] font-bold mb-4">
+                      Análisis KNN (Normalizado)
                     </span>
                     
                     <div className="space-y-2 font-mono text-[11px]">
                       <div className="flex justify-between">
-                        <span className="text-editorial-dim uppercase">Sim. Cosenos</span>
-                        <span className="text-editorial-accent">{(selectedMovie.score || 0.9842 * Math.random()).toFixed(4)}</span>
+                        <span className="text-editorial-dim uppercase">Similitud Reciente</span>
+                        <span className="text-editorial-accent">{(selectedMovie.score || 0).toFixed(4)}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-editorial-dim uppercase">Pearson Coef.</span>
-                        <span className="text-editorial-accent">{(0.8712 * Math.random()).toFixed(4)}</span>
+                        <span className="text-editorial-dim uppercase">Calificación Avg</span>
+                        <span className="text-editorial-accent">{(selectedMovie.avgRating || 0).toFixed(1)} / 5.0</span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-editorial-dim uppercase">Dist. Euclidiana</span>
-                        <span className="text-editorial-accent">{(0.0421 + Math.random() * 0.1).toFixed(4)}</span>
+                        <span className="text-editorial-dim uppercase">Votos</span>
+                        <span className="text-editorial-accent">{selectedMovie.ratingsCount || 0}</span>
                       </div>
                     </div>
                   </div>
@@ -264,23 +284,21 @@ export default function App() {
         {/* Main Content: Recommendations & Search Results */}
         <main className="overflow-y-auto custom-scrollbar">
           {hasDataset ? (
-            <>
-              {/* Controls Overlay */}
-              <div className="px-10 pt-10 flex gap-4 overflow-x-auto pb-4 sticky top-0 bg-editorial-bg z-20">
-                {['cosine', 'pearson', 'euclidean', 'manhattan'].map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => setMetric(m)}
-                    className={`text-[10px] uppercase tracking-widest font-bold px-3 py-1 border transition-all ${
-                      metric === m ? 'border-editorial-accent text-editorial-accent' : 'border-editorial-border text-editorial-dim hover:text-white'
-                    }`}
+              <div className="px-10 pt-10">
+                {selectedMovie && recommendations.length > 0 && !searchTerm && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mb-12"
                   >
-                    {m}
-                  </button>
-                ))}
-              </div>
+                    <RecommendationGraph 
+                      selectedMovie={selectedMovie} 
+                      recommendations={recommendations} 
+                      onSelectMovie={selectMovie} 
+                    />
+                  </motion.div>
+                )}
 
-              <div className="px-10 pt-5">
                 <h3 className="text-white text-base font-bold uppercase tracking-widest mb-6">
                   {searchTerm && searchResults.length > 0 ? `Resultados: ${searchTerm}` : 'También te gustaría ver...'}
                 </h3>
@@ -324,7 +342,6 @@ export default function App() {
                   </div>
                 )}
               </div>
-            </>
           ) : (
             <div className="h-full flex flex-col items-center justify-center p-12 text-center">
               <motion.div 

@@ -17,12 +17,13 @@ interface Movie {
 let movieUserRatings: Record<string, Record<string, number>> = {};
 let movies: Record<string, Movie> = {};
 let movieAvgRatings: Record<string, number> = {};
-let userMovies: Record<string, string[]> = {}; // Inverted index: userId -> movieId[]
+let userMovies: Record<string, string[]> = {}; 
+let movieGenomes: Record<string, Record<string, number>> = {}; // movieId -> { tagId -> relevance }
 
 const upload = multer({ dest: 'uploads/' });
 
 // --- Helper: Line Processor ---
-async function processCSVFile(filePath: string, type: 'movies' | 'ratings') {
+async function processCSVFile(filePath: string, type: 'movies' | 'ratings' | 'genome') {
   const fileStream = fs.createReadStream(filePath);
   const rl = readline.createInterface({
     input: fileStream,
@@ -32,10 +33,22 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings') {
   let isHeader = true;
   const ratingsSum: Record<string, number> = {};
   const ratingsCount: Record<string, number> = {};
+  let genomeColumns = { movieId: 0, tagId: 1, score: 2 };
 
   for await (const line of rl) {
-    if (isHeader || !line.trim()) {
+    if (!line.trim()) continue;
+    
+    if (isHeader) {
       isHeader = false;
+      const header = line.toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      if (type === 'genome') {
+        const mIdx = header.findIndex(h => h === 'movieid' || h === 'item_id');
+        const tIdx = header.findIndex(h => h === 'tagid' || h === 'tag');
+        const sIdx = header.findIndex(h => h === 'relevance' || h === 'score');
+        if (mIdx !== -1) genomeColumns.movieId = mIdx;
+        if (tIdx !== -1) genomeColumns.tagId = tIdx;
+        if (sIdx !== -1) genomeColumns.score = sIdx;
+      }
       continue;
     }
 
@@ -68,7 +81,7 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings') {
         title: cleanTitle,
         genres: genres ? genres.replace(/^"|"$/g, '').split('|') : []
       };
-    } else {
+    } else if (type === 'ratings') {
       const [userId, movieId, ratingStr] = row;
       const rating = parseFloat(ratingStr);
       
@@ -82,6 +95,14 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings') {
 
       ratingsSum[movieId] = (ratingsSum[movieId] || 0) + rating;
       ratingsCount[movieId] = (ratingsCount[movieId] || 0) + 1;
+    } else if (type === 'genome') {
+      const movieId = row[genomeColumns.movieId];
+      const tagId = row[genomeColumns.tagId];
+      const relevance = parseFloat(row[genomeColumns.score]);
+      if (!movieId || !tagId || isNaN(relevance)) continue;
+      
+      if (!movieGenomes[movieId]) movieGenomes[movieId] = {};
+      movieGenomes[movieId][tagId] = relevance;
     }
   }
 
@@ -95,6 +116,7 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings') {
 async function reloadData() {
   const moviesPath = path.join(process.cwd(), 'public/data/movies.csv');
   const ratingsPath = path.join(process.cwd(), 'public/data/ratings.csv');
+  const genomePath = path.join(process.cwd(), 'public/data/genome-scores.csv');
 
   if (!fs.existsSync(moviesPath) || !fs.existsSync(ratingsPath)) {
     console.log('Dataset missing.');
@@ -106,10 +128,15 @@ async function reloadData() {
   movies = {};
   movieAvgRatings = {};
   userMovies = {};
+  movieGenomes = {};
 
   await processCSVFile(moviesPath, 'movies');
   await processCSVFile(ratingsPath, 'ratings');
-  console.log(`Loaded ${Object.keys(movies).length} movies.`);
+  if (fs.existsSync(genomePath)) {
+    console.log('Loading Tag Genome...');
+    await processCSVFile(genomePath, 'genome');
+  }
+  console.log(`Loaded ${Object.keys(movies).length} movies and ${Object.keys(movieGenomes).length} genomes.`);
 }
 
 // --- Pure Math Metrics ---
@@ -205,6 +232,28 @@ function pearsonCorrelation(id1: string, id2: string): number {
   return num / den;
 }
 
+function genomeCosineSimilarity(id1: string, id2: string): number {
+  const g1 = movieGenomes[id1];
+  const g2 = movieGenomes[id2];
+  if (!g1 || !g2) return 0;
+
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+
+  // Genome vectors are fixed 1128 tags, so we can iterate over one and check the other
+  for (const tagId in g1) {
+    const v1 = g1[tagId];
+    const v2 = g2[tagId] || 0;
+    dotProduct += v1 * v2;
+    normA += v1 * v1;
+    normB += v2 * v2;
+  }
+
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
 // --- K-NN Algorithm ---
 function getRecommendations(movieId: string, k: number = 10, metric: string = 'cosine') {
   if (!movies[movieId]) return [];
@@ -212,52 +261,78 @@ function getRecommendations(movieId: string, k: number = 10, metric: string = 'c
   const movieRatings = movieUserRatings[movieId] || {};
   const viewers = Object.keys(movieRatings);
   
-  // Step 1: Find candidates (movies viewed by same users)
-  const candidateSet = new Set<string>();
-  viewers.forEach(userId => {
-    const list = userMovies[userId] || [];
-    list.forEach(mId => {
-      if (mId !== movieId) candidateSet.add(mId);
+  // Decide if we use Genome or Ratings
+  // If user explicitly asks for 'genome' or uses 'cosine' and genome data is available
+  const useGenome = metric === 'genome' || (metric === 'cosine' && movieGenomes[movieId]);
+
+  let candidateIds: string[] = [];
+
+  if (useGenome && movieGenomes[movieId]) {
+    // CONTENT-BASED: Compare against all movies with avg rating >= 3.0 and that have genome data
+    candidateIds = Object.keys(movieGenomes).filter(id => 
+      id !== movieId && (movieAvgRatings[id] || 0) >= 3.0
+    );
+    console.log(`[KNN-Genome] Finding content matches from ${candidateIds.length} high-rated movies`);
+  } else {
+    // COLLABORATIVE FILTERING: Only movies viewed by same users
+    const candidateSet = new Set<string>();
+    viewers.forEach(userId => {
+      const list = userMovies[userId] || [];
+      list.forEach(mId => {
+        if (mId !== movieId) candidateSet.add(mId);
+      });
     });
-  });
+    candidateIds = Array.from(candidateSet);
+    console.log(`[KNN-CF] Finding collaborative matches from ${candidateIds.length} user-shared movies`);
+  }
 
   const similarities: { movieId: string; score: number }[] = [];
+  const calcStart = Date.now();
   
-  candidateSet.forEach(otherId => {
-    // Only consider movies with average rating > 3.0
-    if ((movieAvgRatings[otherId] || 0) <= 3.0) return;
+  candidateIds.forEach(otherId => {
+    // Quality threshold: establish a taste threshold (Establish a taste threshold)
+    if ((movieAvgRatings[otherId] || 0) < 3.0) return;
 
-    let score = 0;
-    switch(metric) {
-      case 'euclidean': 
-        const distE = euclideanDistance(movieId, otherId);
-        score = distE === Infinity ? -Infinity : -distE;
-        break;
-      case 'manhattan':
-        const distM = manhattanDistance(movieId, otherId);
-        score = distM === Infinity ? -Infinity : -distM;
-        break;
-      case 'pearson':
-        score = pearsonCorrelation(movieId, otherId);
-        break;
-      case 'cosine':
-      default:
-        score = cosineSimilarity(movieId, otherId);
-        break;
+    let score = -Infinity;
+    
+    if (useGenome) {
+      score = genomeCosineSimilarity(movieId, otherId);
+    } else {
+      switch (metric) {
+        case 'cosine':
+          score = cosineSimilarity(movieId, otherId);
+          break;
+        case 'pearson':
+          score = pearsonCorrelation(movieId, otherId);
+          break;
+        case 'euclidean':
+          const distE = euclideanDistance(movieId, otherId);
+          score = distE === Infinity ? -Infinity : 1 / (1 + distE);
+          break;
+        case 'manhattan':
+          const distM = manhattanDistance(movieId, otherId);
+          score = distM === Infinity ? -Infinity : 1 / (1 + distM);
+          break;
+      }
     }
     
-    if (score !== -Infinity && !isNaN(score) && score !== 0) {
+    if (score !== -Infinity && !isNaN(score) && score > 0) {
       similarities.push({ movieId: otherId, score });
     }
   });
 
-  similarities.sort((a, b) => b.score - a.score);
-  
-  return similarities.slice(0, k).map(s => ({
-    ...movies[s.movieId],
-    score: s.score,
-    avgRating: movieAvgRatings[s.movieId]
-  }));
+  const duration = Date.now() - calcStart;
+  console.log(`[KNN] Metric: ${useGenome ? 'Genome-Cosine' : metric}. Scores computed in ${duration}ms`);
+
+  return similarities
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k)
+    .map(s => ({
+      ...movies[s.movieId],
+      score: s.score,
+      avgRating: movieAvgRatings[s.movieId],
+      ratingsCount: movieUserRatings[s.movieId] ? Object.keys(movieUserRatings[s.movieId]).length : 0
+    }));
 }
 
 // --- Server Setup ---
@@ -284,21 +359,35 @@ async function startServer() {
       
       let foundMovies = false;
       let foundRatings = false;
+      let foundGenome = false;
+
+      const dataDir = path.join(process.cwd(), 'public/data');
+      if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
       zipEntries.forEach(entry => {
-        if (entry.entryName.toLowerCase() === 'movies.csv') {
+        if (entry.isDirectory) return;
+        
+        const filename = path.basename(entry.entryName).toLowerCase();
+        
+        if (filename === 'movies.csv') {
           foundMovies = true;
-          zip.extractEntryTo(entry, 'public/data', false, true);
-        }
-        if (entry.entryName.toLowerCase() === 'ratings.csv') {
+          zip.extractEntryTo(entry, dataDir, false, true);
+        } else if (filename === 'ratings.csv') {
           foundRatings = true;
-          zip.extractEntryTo(entry, 'public/data', false, true);
+          zip.extractEntryTo(entry, dataDir, false, true);
+        } else if (filename === 'genome-scores.csv' || filename === 'tagdl.csv' || filename === 'glmer.csv') {
+          foundGenome = true;
+          // Normalize to genome-scores.csv so our loader finds it
+          const content = entry.getData();
+          fs.writeFileSync(path.join(dataDir, 'genome-scores.csv'), content);
         }
       });
 
       if (!foundMovies || !foundRatings) {
         return res.status(400).json({ error: 'Missing movies.csv or ratings.csv in ZIP' });
       }
+
+      console.log(`Upload processed. Movies: ${foundMovies}, Ratings: ${foundRatings}, Genome: ${foundGenome}`);
 
       // Process from disk
       await reloadData();
@@ -329,9 +418,16 @@ async function startServer() {
       results = shuffled.slice(0, 5);
     }
     
+    const enrichedResults = results.map(m => ({
+      ...m,
+      score: 1.0, // High score for direct search matches
+      avgRating: movieAvgRatings[m.movieId] || 0,
+      ratingsCount: movieUserRatings[m.movieId] ? Object.keys(movieUserRatings[m.movieId]).length : 0
+    }));
+
     const duration = Date.now() - startTime;
-    console.log(`[Search] Found ${results.length} results in ${duration}ms`);
-    res.json(results);
+    console.log(`[Search] Found ${enrichedResults.length} results in ${duration}ms`);
+    res.json(enrichedResults);
   });
 
   app.get('/api/recommendations/:movieId', (req, res) => {
