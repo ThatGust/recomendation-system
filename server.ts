@@ -13,16 +13,181 @@ interface Movie {
   genres: string[];
 }
 
+interface MusicTrack {
+  trackId: string;
+  artists: string;
+  trackName: string;
+  trackGenre: string;
+  valence: number;
+  energy: number;
+  danceability: number;
+}
+
 // --- Data Storage (Nested Dictionaries for Anti-Sparsity) ---
 let movieUserRatings: Record<string, Record<string, number>> = {};
 let movies: Record<string, Movie> = {};
+let musicTracks: Record<string, MusicTrack> = {};
 let movieAvgRatings: Record<string, number> = {};
 let userMovies: Record<string, string[]> = {}; 
 let movieGenomes: Record<string, Record<string, number>> = {}; // movieId -> { tagId -> relevance }
 
+// Genre Profiles mapping audio features to movie categories
+const genreProfiles: Record<string, { valence: number, energy: number, danceability: number }> = {
+  "Action": { valence: 0.4, energy: 0.9, danceability: 0.5 },
+  "Adventure": { valence: 0.7, energy: 0.8, danceability: 0.4 },
+  "Animation": { valence: 0.8, energy: 0.7, danceability: 0.6 },
+  "Children": { valence: 0.9, energy: 0.6, danceability: 0.4 },
+  "Comedy": { valence: 0.8, energy: 0.6, danceability: 0.7 },
+  "Crime": { valence: 0.3, energy: 0.6, danceability: 0.4 },
+  "Documentary": { valence: 0.5, energy: 0.2, danceability: 0.2 },
+  "Drama": { valence: 0.3, energy: 0.3, danceability: 0.3 },
+  "Fantasy": { valence: 0.6, energy: 0.5, danceability: 0.4 },
+  "Film-Noir": { valence: 0.1, energy: 0.2, danceability: 0.2 },
+  "Horror": { valence: 0.1, energy: 0.8, danceability: 0.3 },
+  "Musical": { valence: 0.7, energy: 0.6, danceability: 0.9 },
+  "Mystery": { valence: 0.3, energy: 0.4, danceability: 0.3 },
+  "Romance": { valence: 0.6, energy: 0.3, danceability: 0.4 },
+  "Sci-Fi": { valence: 0.5, energy: 0.7, danceability: 0.4 },
+  "Thriller": { valence: 0.2, energy: 0.8, danceability: 0.4 },
+  "War": { valence: 0.2, energy: 0.7, danceability: 0.3 },
+  "Western": { valence: 0.4, energy: 0.6, danceability: 0.4 },
+};
+
+// Loading state
+let isDatasetLoading = false;
+let loadProgress = {
+  status: 'idle',
+  movies: 0,
+  ratings: 0,
+  genomes: 0,
+  music: 0,
+  error: null as string | null
+};
+
 const upload = multer({ dest: 'uploads/' });
 
 // --- Helper: Line Processor ---
+async function processMusicCSVFile(filePath: string) {
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  let isHeader = true;
+  let count = 0;
+  let cols = { id: -1, name: -1, artists: -1, genre: -1, valence: -1, energy: -1, dance: -1 };
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    
+    if (isHeader) {
+      isHeader = false;
+      const header = line.toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      cols.id = header.findIndex(h => h.includes('track_id'));
+      cols.name = header.findIndex(h => h.includes('track_name'));
+      cols.artists = header.findIndex(h => h.includes('artists'));
+      cols.genre = header.findIndex(h => h.includes('track_genre'));
+      cols.valence = header.findIndex(h => h.includes('valence'));
+      cols.energy = header.findIndex(h => h.includes('energy'));
+      cols.dance = header.findIndex(h => h.includes('danceability'));
+      continue;
+    }
+
+    if (cols.id === -1 || cols.name === -1) continue;
+
+    const row: string[] = [];
+    let currentField = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (char === '"') inQuotes = !inQuotes;
+      else if (char === ',' && !inQuotes) {
+        row.push(currentField.trim());
+        currentField = '';
+      } else currentField += char;
+    }
+    row.push(currentField.trim());
+
+    if (row[cols.id]) {
+      musicTracks[row[cols.id]] = {
+        trackId: row[cols.id],
+        trackName: row[cols.name]?.replace(/^"|"$/g, '') || 'Unknown Track',
+        artists: row[cols.artists]?.replace(/^"|"$/g, '') || 'Unknown Artist',
+        trackGenre: row[cols.genre] || 'Unknown',
+        valence: parseFloat(row[cols.valence]) || 0.5,
+        energy: parseFloat(row[cols.energy]) || 0.5,
+        danceability: parseFloat(row[cols.dance]) || 0.5
+      };
+      count++;
+      if (count % 20000 === 0) loadProgress.music = count;
+    }
+  }
+  loadProgress.music = count;
+}
+async function processJSONLFile(filePath: string, type: 'movies' | 'ratings') {
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  const ratingsSum: Record<string, number> = {};
+  const ratingsCount: Record<string, number> = {};
+  let count = 0;
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    try {
+      const data = JSON.parse(line);
+      if (type === 'movies') {
+        const id = (data.item_id || data.id || data.movieId || data.item_id)?.toString();
+        if (!id) continue;
+        movies[id] = {
+          movieId: id,
+          title: data.title || 'Unknown Title',
+          genres: data.genres ? (Array.isArray(data.genres) ? data.genres : data.genres.split('|')) : []
+        };
+        if (data.avgRating) movieAvgRatings[id] = parseFloat(data.avgRating);
+        count++;
+        if (count % 10000 === 0) loadProgress.movies = count;
+      } else if (type === 'ratings') {
+        const mId = (data.item_id || data.movieId)?.toString();
+        const uId = (data.user_id || data.userId)?.toString();
+        const rating = parseFloat(data.rating);
+        if (!mId || !uId || isNaN(rating)) continue;
+
+        if (!movieUserRatings[mId]) movieUserRatings[mId] = {};
+        movieUserRatings[mId][uId] = rating;
+
+        if (!userMovies[uId]) userMovies[uId] = [];
+        userMovies[uId].push(mId);
+
+        ratingsSum[mId] = (ratingsSum[mId] || 0) + rating;
+        ratingsCount[mId] = (ratingsCount[mId] || 0) + 1;
+        count++;
+        if (count % 200000 === 0) {
+          loadProgress.ratings = count;
+          console.log(`[Loading] ${count} ratings loaded...`);
+        }
+      }
+    } catch (e) {
+      continue;
+    }
+  }
+
+  if (type === 'ratings') {
+    Object.keys(ratingsSum).forEach(id => {
+      if (!movieAvgRatings[id]) {
+        movieAvgRatings[id] = ratingsSum[id] / ratingsCount[id];
+      }
+    });
+    loadProgress.ratings = count;
+  } else {
+    loadProgress.movies = count;
+  }
+}
+
 async function processCSVFile(filePath: string, type: 'movies' | 'ratings' | 'genome') {
   const fileStream = fs.createReadStream(filePath);
   const rl = readline.createInterface({
@@ -33,7 +198,13 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings' | 'ge
   let isHeader = true;
   const ratingsSum: Record<string, number> = {};
   const ratingsCount: Record<string, number> = {};
-  let genomeColumns = { movieId: 0, tagId: 1, score: 2 };
+  let count = 0;
+  
+  let columns = { 
+    movie: { id: 0, title: 1, genres: 2 },
+    rating: { user: 0, movie: 1, score: 2 },
+    genome: { movieId: 0, tagId: 1, score: 2 } 
+  };
 
   for await (const line of rl) {
     if (!line.trim()) continue;
@@ -41,18 +212,32 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings' | 'ge
     if (isHeader) {
       isHeader = false;
       const header = line.toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-      if (type === 'genome') {
+      
+      if (type === 'movies') {
+        const idIdx = header.findIndex(h => h.includes('movieid') || h.includes('item_id') || h === 'id');
+        const titleIdx = header.findIndex(h => h.includes('title') || h === 'name');
+        const genresIdx = header.findIndex(h => h.includes('genres') || h === 'genre');
+        if (idIdx !== -1) columns.movie.id = idIdx;
+        if (titleIdx !== -1) columns.movie.title = titleIdx;
+        if (genresIdx !== -1) columns.movie.genres = genresIdx;
+      } else if (type === 'ratings') {
+        const userIdx = header.findIndex(h => h.includes('userid') || h.includes('user_id'));
+        const movieIdx = header.findIndex(h => h.includes('movieid') || h.includes('item_id'));
+        const scoreIdx = header.findIndex(h => h.includes('rating') || h === 'score');
+        if (userIdx !== -1) columns.rating.user = userIdx;
+        if (movieIdx !== -1) columns.rating.movie = movieIdx;
+        if (scoreIdx !== -1) columns.rating.score = scoreIdx;
+      } else if (type === 'genome') {
         const mIdx = header.findIndex(h => h === 'movieid' || h === 'item_id');
         const tIdx = header.findIndex(h => h === 'tagid' || h === 'tag');
         const sIdx = header.findIndex(h => h === 'relevance' || h === 'score');
-        if (mIdx !== -1) genomeColumns.movieId = mIdx;
-        if (tIdx !== -1) genomeColumns.tagId = tIdx;
-        if (sIdx !== -1) genomeColumns.score = sIdx;
+        if (mIdx !== -1) columns.genome.movieId = mIdx;
+        if (tIdx !== -1) columns.genome.tagId = tIdx;
+        if (sIdx !== -1) columns.genome.score = sIdx;
       }
       continue;
     }
 
-    // Improved CSV splitter that handles quoted fields with commas and allows spaces
     const row: string[] = [];
     let currentField = '';
     let inQuotes = false;
@@ -71,7 +256,10 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings' | 'ge
     row.push(currentField.trim());
 
     if (type === 'movies') {
-      const [movieId, title, genres] = row;
+      const movieId = row[columns.movie.id];
+      const title = row[columns.movie.title];
+      const genres = row[columns.movie.genres];
+      
       if (!movieId || isNaN(parseInt(movieId))) continue;
       
       const cleanTitle = title ? title.replace(/^"|"$/g, '').trim() : 'Unknown Title';
@@ -81,8 +269,12 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings' | 'ge
         title: cleanTitle,
         genres: genres ? genres.replace(/^"|"$/g, '').split('|') : []
       };
+      count++;
+      if (count % 10000 === 0) loadProgress.movies = count;
     } else if (type === 'ratings') {
-      const [userId, movieId, ratingStr] = row;
+      const userId = row[columns.rating.user];
+      const movieId = row[columns.rating.movie];
+      const ratingStr = row[columns.rating.score];
       const rating = parseFloat(ratingStr);
       
       if (!movieId || isNaN(rating) || !userId) continue;
@@ -95,48 +287,100 @@ async function processCSVFile(filePath: string, type: 'movies' | 'ratings' | 'ge
 
       ratingsSum[movieId] = (ratingsSum[movieId] || 0) + rating;
       ratingsCount[movieId] = (ratingsCount[movieId] || 0) + 1;
+      count++;
+      if (count % 200000 === 0) {
+        loadProgress.ratings = count;
+        console.log(`[Loading] ${count} ratings loaded...`);
+      }
     } else if (type === 'genome') {
-      const movieId = row[genomeColumns.movieId];
-      const tagId = row[genomeColumns.tagId];
-      const relevance = parseFloat(row[genomeColumns.score]);
+      const movieId = row[columns.genome.movieId];
+      const tagId = row[columns.genome.tagId];
+      const relevance = parseFloat(row[columns.genome.score]);
       if (!movieId || !tagId || isNaN(relevance)) continue;
       
       if (!movieGenomes[movieId]) movieGenomes[movieId] = {};
       movieGenomes[movieId][tagId] = relevance;
+      count++;
+      if (count % 500000 === 0) loadProgress.genomes = count;
     }
   }
 
   if (type === 'ratings') {
     Object.keys(ratingsSum).forEach(id => {
-      movieAvgRatings[id] = ratingsSum[id] / ratingsCount[id];
+      if (!movieAvgRatings[id]) {
+        movieAvgRatings[id] = ratingsSum[id] / ratingsCount[id];
+      }
     });
+    loadProgress.ratings = count;
+  } else if (type === 'movies') {
+    loadProgress.movies = count;
+  } else {
+    loadProgress.genomes = count;
   }
 }
 
 async function reloadData() {
-  const moviesPath = path.join(process.cwd(), 'public/data/movies.csv');
-  const ratingsPath = path.join(process.cwd(), 'public/data/ratings.csv');
-  const genomePath = path.join(process.cwd(), 'public/data/genome-scores.csv');
+  if (isDatasetLoading) return;
+  
+  const dataDir = path.join(process.cwd(), 'public/data');
+  if (!fs.existsSync(dataDir)) return;
+  
+  const files = fs.readdirSync(dataDir);
+  const moviesCSV = files.find(f => f.toLowerCase() === 'movies.csv');
+  const moviesJSON = files.find(f => f.toLowerCase() === 'metadata.json' || f.toLowerCase() === 'movies.json');
+  const ratingsCSV = files.find(f => f.toLowerCase() === 'ratings.csv');
+  const ratingsJSON = files.find(f => f.toLowerCase() === 'ratings.json');
+  const genomeFile = files.find(f => ['genome-scores.csv', 'tagdl.csv', 'glmer.csv', 'genome_scores.csv'].includes(f.toLowerCase()));
+  const musicFile = files.find(f => f.toLowerCase().includes('track') || f.toLowerCase().includes('spotify') || f.toLowerCase() === 'dataset.csv');
 
-  if (!fs.existsSync(moviesPath) || !fs.existsSync(ratingsPath)) {
-    console.log('Dataset missing.');
+  if (!(moviesCSV || moviesJSON) || !(ratingsCSV || ratingsJSON)) {
+    console.log('Dataset incomplete.');
     return;
   }
 
-  console.log('Reloading data from disk...');
-  movieUserRatings = {};
-  movies = {};
-  movieAvgRatings = {};
-  userMovies = {};
-  movieGenomes = {};
+  console.log('--- STARTING DATA LOAD ---');
+  isDatasetLoading = true;
+  loadProgress = { status: 'loading', movies: 0, ratings: 0, genomes: 0, music: 0, error: null };
 
-  await processCSVFile(moviesPath, 'movies');
-  await processCSVFile(ratingsPath, 'ratings');
-  if (fs.existsSync(genomePath)) {
-    console.log('Loading Tag Genome...');
-    await processCSVFile(genomePath, 'genome');
+  try {
+    // Reset state
+    movieUserRatings = {};
+    movies = {};
+    musicTracks = {};
+    movieAvgRatings = {};
+    userMovies = {};
+    movieGenomes = {};
+
+    // Process Movies
+    if (moviesJSON) await processJSONLFile(path.join(dataDir, moviesJSON), 'movies');
+    else if (moviesCSV) await processCSVFile(path.join(dataDir, moviesCSV), 'movies');
+
+    // Process Ratings
+    if (ratingsJSON) await processJSONLFile(path.join(dataDir, ratingsJSON), 'ratings');
+    else if (ratingsCSV) await processCSVFile(path.join(dataDir, ratingsCSV), 'ratings');
+
+    // Process Genome
+    if (genomeFile) {
+      console.log(`Loading Genome from ${genomeFile}...`);
+      await processCSVFile(path.join(dataDir, genomeFile), 'genome');
+    }
+
+    // Process Music
+    if (musicFile) {
+      console.log(`Loading Music from ${musicFile}...`);
+      await processMusicCSVFile(path.join(dataDir, musicFile));
+    }
+
+    console.log(`--- LOAD COMPLETE ---`);
+    console.log(`Summary: ${Object.keys(movies).length} movies, ${loadProgress.ratings} ratings, ${Object.keys(musicTracks).length} music tracks.`);
+    loadProgress.status = 'ready';
+  } catch (err: any) {
+    console.error('--- LOAD FAILED ---', err);
+    loadProgress.status = 'error';
+    loadProgress.error = err.message;
+  } finally {
+    isDatasetLoading = false;
   }
-  console.log(`Loaded ${Object.keys(movies).length} movies and ${Object.keys(movieGenomes).length} genomes.`);
 }
 
 // --- Pure Math Metrics ---
@@ -335,24 +579,137 @@ function getRecommendations(movieId: string, k: number = 10, metric: string = 'c
     }));
 }
 
+// --- Music-to-Movie Mapping Algorithm ---
+function getMovieProfile(movie: Movie) {
+  if (!movie.genres || movie.genres.length === 0) return null;
+  
+  let v = 0, e = 0, d = 0, count = 0;
+  movie.genres.forEach(genre => {
+    const profile = genreProfiles[genre];
+    if (profile) {
+      v += profile.valence;
+      e += profile.energy;
+      d += profile.danceability;
+      count++;
+    }
+  });
+
+  if (count === 0) return null;
+  return { valence: v / count, energy: e / count, danceability: d / count };
+}
+
+function getMusicBasedRecommendations(trackId: string, k: number = 10) {
+  const track = musicTracks[trackId];
+  if (!track) return [];
+
+  console.log(`[Music-Mapping] Profiling track: ${track.trackName} | V:${track.valence} E:${track.energy} D:${track.danceability}`);
+
+  const candidates: { movieId: string, similarity: number }[] = [];
+  
+  Object.values(movies).forEach(movie => {
+    const movieProfile = getMovieProfile(movie);
+    if (!movieProfile) return; // Skip if no genre mapping possible
+
+    // Euclidean distance in 3D space
+    const dist = Math.sqrt(
+      Math.pow(track.valence - movieProfile.valence, 2) +
+      Math.pow(track.energy - movieProfile.energy, 2) +
+      Math.pow(track.danceability - movieProfile.danceability, 2)
+    );
+
+    // Convert distance to similarity score
+    candidates.push({ movieId: movie.movieId, similarity: 1 / (1 + dist) });
+  });
+
+  return candidates
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, k)
+    .map(c => ({
+      ...movies[c.movieId],
+      score: c.similarity,
+      avgRating: movieAvgRatings[c.movieId] || 0,
+    }));
+}
+
 // --- Server Setup ---
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  // Music Search Endpoint
+  app.get('/api/music/search', (req, res) => {
+    const query = (req.query.q as string || '').toLowerCase();
+    if (!query) return res.json([]);
+
+    const results = Object.values(musicTracks)
+      .filter(t => t.trackName.toLowerCase().includes(query) || t.artists.toLowerCase().includes(query))
+      .slice(0, 10);
+    
+    res.json(results);
+  });
+
+  // Music Based Recommendations Endpoint
+  app.get('/api/music/recommendations/:trackId', (req, res) => {
+    const { trackId } = req.params;
+    const recs = getMusicBasedRecommendations(trackId);
+    if (recs.length === 0) {
+      // Check if any movies actually have genres
+      const moviesWithGenres = Object.values(movies).some(m => m.genres && m.genres.length > 0);
+      if (!moviesWithGenres) {
+        return res.status(400).json({ error: 'El dataset de películas no contiene géneros, lo cual es necesario para la recomendación musical.' });
+      }
+    }
+    res.json(recs);
+  });
+
   // Intentar cargar si existen archivos
   if (!fs.existsSync('public/data')) fs.mkdirSync('public/data', { recursive: true });
-  await reloadData();
+  
+  // Start loading in background to not block port binding
+  reloadData().catch(console.error);
 
   app.get('/api/dataset-status', (req, res) => {
     const hasData = Object.keys(movies).length > 0;
-    res.json({ hasData, count: Object.keys(movies).length });
+    res.json({ 
+      hasData, 
+      isReady: loadProgress.status === 'ready',
+      isLoading: isDatasetLoading,
+      count: Object.keys(movies).length,
+      progress: loadProgress
+    });
+  });
+
+  app.post('/api/reset-dataset', (req, res) => {
+    const dataDir = path.join(process.cwd(), 'public/data');
+    console.log('[Reset] Deleting dataset and clearing memory state...');
+    
+    try {
+      if (fs.existsSync(dataDir)) {
+        // Use recursive rm to ensure even nested folders or hidden files are gone
+        fs.rmSync(dataDir, { recursive: true, force: true });
+        fs.mkdirSync(dataDir, { recursive: true });
+      }
+      
+      // Reset in-memory state completely
+      movieUserRatings = {};
+      movies = {};
+      movieAvgRatings = {};
+      userMovies = {};
+      movieGenomes = {};
+
+      console.log('[Reset] Success');
+      res.json({ success: true, message: 'Dataset deleted and state reset' });
+    } catch (err) {
+      console.error('[Reset] Error during cleanup:', err);
+      res.status(500).json({ error: 'Failed to fully reset dataset directory' });
+    }
   });
 
   app.post('/api/upload-dataset', upload.single('dataset'), async (req, res) => {
     const file = (req as any).file;
     if (!file) return res.status(400).json({ error: 'No file uploaded' });
 
+    console.log(`[Upload] Processing ZIP: ${file.originalname}`);
     try {
       const zip = new AdmZip(file.path);
       const zipEntries = zip.getEntries();
@@ -364,41 +721,103 @@ async function startServer() {
       const dataDir = path.join(process.cwd(), 'public/data');
       if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
+      // Clean old files before extracting new ones to avoid collision/stale files
+      const existingFiles = fs.readdirSync(dataDir);
+      for (const f of existingFiles) {
+        fs.unlinkSync(path.join(dataDir, f));
+      }
+
       zipEntries.forEach(entry => {
         if (entry.isDirectory) return;
         
-        const filename = path.basename(entry.entryName).toLowerCase();
+        const fullPath = entry.entryName.toLowerCase();
+        const filename = path.basename(fullPath);
         
-        if (filename === 'movies.csv') {
+        console.log(`[Upload] Examining entry: ${fullPath}`);
+
+        // Movies detection (CSV or JSONL)
+        if (filename === 'movies.csv' || filename === 'movie.csv' || filename === 'metadata.json' || filename === 'movies.json') {
+          console.log(`[Upload] Found Movies: ${fullPath}`);
           foundMovies = true;
           zip.extractEntryTo(entry, dataDir, false, true);
-        } else if (filename === 'ratings.csv') {
+        } 
+        // Ratings detection (CSV or JSONL)
+        else if (filename === 'ratings.csv' || filename === 'rating.csv' || filename === 'ratings.json') {
+          console.log(`[Upload] Found Ratings: ${fullPath}`);
           foundRatings = true;
           zip.extractEntryTo(entry, dataDir, false, true);
-        } else if (filename === 'genome-scores.csv' || filename === 'tagdl.csv' || filename === 'glmer.csv') {
+        } 
+        // Genome scores detection
+        else if (filename === 'genome-scores.csv' || filename === 'tagdl.csv' || filename === 'glmer.csv' || filename === 'genome_scores.csv' || filename.includes('genome')) {
+          console.log(`[Upload] Found Genome: ${fullPath}`);
           foundGenome = true;
-          // Normalize to genome-scores.csv so our loader finds it
-          const content = entry.getData();
-          fs.writeFileSync(path.join(dataDir, 'genome-scores.csv'), content);
+          zip.extractEntryTo(entry, dataDir, false, true);
         }
       });
 
       if (!foundMovies || !foundRatings) {
-        return res.status(400).json({ error: 'Missing movies.csv or ratings.csv in ZIP' });
+        throw new Error(`Dataset incompleto en el ZIP. Se requiere al menos un archivo de películas (movies.csv/metadata.json) y uno de calificaciones (ratings.csv/ratings.json). Encontrados: Películas=${foundMovies}, Ratings=${foundRatings}`);
       }
 
-      console.log(`Upload processed. Movies: ${foundMovies}, Ratings: ${foundRatings}, Genome: ${foundGenome}`);
+      console.log(`[Upload] Extraction complete. Triggering background reload...`);
 
-      // Process from disk
-      await reloadData();
+      // Process from disk in background
+      reloadData().catch(console.error);
 
       // Cleanup temp upload
-      fs.unlinkSync(file.path);
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
-      res.json({ message: 'Dataset uploaded and processed successfully' });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: 'Failed to process ZIP file' });
+      res.json({ message: 'Dataset uploaded and processing has started.' });
+    } catch (err: any) {
+      console.error('[Upload] Error processing dataset:', err);
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      res.status(500).json({ error: err.message || 'Failed to process ZIP file' });
+    }
+  });
+
+  app.post('/api/upload-music', upload.single('dataset'), async (req, res) => {
+    const file = (req as any).file;
+    if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+    console.log(`[Music-Upload] Processing ZIP: ${file.originalname}`);
+    try {
+      const zip = new AdmZip(file.path);
+      const zipEntries = zip.getEntries();
+      const dataDir = path.join(process.cwd(), 'public/data');
+      if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+
+      let foundMusic = false;
+
+      zipEntries.forEach(entry => {
+        if (entry.isDirectory) return;
+        const entryName = entry.entryName.toLowerCase();
+        
+        // Music detection: search for track_id column in any CSV
+        if (entryName.endsWith('.csv')) {
+          const content = entry.getData().toString('utf8');
+          const firstLine = content.split('\n')[0].toLowerCase();
+          if (firstLine.includes('track_id')) {
+            console.log(`[Music-Upload] Found Music file: ${entryName}`);
+            foundMusic = true;
+            // Extract it specifically as spotify_tracks.csv to be found by loader
+            fs.writeFileSync(path.join(dataDir, 'spotify_tracks.csv'), entry.getData());
+          }
+        }
+      });
+
+      if (!foundMusic) {
+        throw new Error('No se encontró un archivo de música compatible (track_id) dentro del ZIP.');
+      }
+
+      console.log(`[Music-Upload] Extraction complete. Triggering background reload...`);
+      reloadData().catch(console.error);
+
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      res.json({ message: 'Dataset de música subido y procesándose.' });
+    } catch (err: any) {
+      console.error('[Music-Upload] Error:', err);
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      res.status(500).json({ error: err.message || 'Error procesando ZIP de música' });
     }
   });
 
